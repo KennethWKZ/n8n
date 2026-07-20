@@ -49,6 +49,10 @@ RUN mkdir -p /usr/local/bin && \
     chown -R node:node /home/node && \
     rm -rf /root/.npm /tmp/*
 
+RUN wget -O /usr/local/share/ca-certificates/aws-rds-combined-ca-bundle.pem -q "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" && \
+		chmod 644 /usr/local/share/ca-certificates/aws-rds-combined-ca-bundle.pem && \
+		update-ca-certificates
+
 EXPOSE 5678/tcp
 USER node
 ENTRYPOINT ["tini", "--", "/docker-entrypoint.sh"]

@@ -153,6 +153,10 @@ COPY --from=python-runner-builder --chown=root:root /app/task-runner-python /opt
 COPY --from=launcher-downloader /launcher-bin/* /usr/local/bin/
 COPY --chown=root:root docker/images/runners/n8n-task-runners.json /etc/n8n-task-runners.json
 
+RUN wget -O /usr/local/share/ca-certificates/aws-rds-combined-ca-bundle.pem -q "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem" && \
+		chmod 644 /usr/local/share/ca-certificates/aws-rds-combined-ca-bundle.pem && \
+		update-ca-certificates
+
 USER runner
 
 EXPOSE 5680/tcp
