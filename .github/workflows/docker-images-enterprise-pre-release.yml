@@ -1,0 +1,174 @@
+name: 'Docker: Build and Push (Enterprise Pre Release tag or branch only)'
+
+env:
+  NODE_OPTIONS: '--max-old-space-size=8192'
+  NODE_VERSION: '24.18.0'
+  PNPM_VERSION: '11.15.0'
+
+on:
+  push:
+    tags:
+      - 'enterprise-pre-release'
+    branches:
+      - 'enterprise-pre-release'
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push-docker:
+    strategy:
+      matrix:
+        platform: [arm64]
+        include:
+          # - platform: amd64
+          #   runner: ubuntu-latest
+          #   docker_platform: linux/amd64
+          - platform: arm64
+            runner: [self-hosted, linux, ARM64]
+            docker_platform: linux/arm64
+
+    name: Build and Push Docker Images (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate
+
+      - name: Get pnpm store directory
+        run: |
+          echo "PNPM_STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ env.PNPM_STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure Turborepo Cache
+        uses: actions/cache@v6
+        with:
+          path: .turbo
+          key: ${{ runner.os }}-turbo-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Build n8n for Docker
+        run: pnpm build:n8n
+
+      - name: Set build context
+        id: context
+        run: |
+          REF_NAME=${GITHUB_REF##*/}
+
+          {
+            echo "release_type=custom"
+            echo "n8n_version=${REF_NAME}"
+            echo "push_enabled=true"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Determine Docker tags
+        id: determine-tags
+        run: |
+          REF_NAME=${GITHUB_REF##*/}
+          PLATFORM="${{ matrix.platform }}"
+          ECR_REPO_URL=${{ secrets.ECR_REPO_URL }}
+          RUNNERS_ECR_REPO_URL=${{ secrets.RUNNERS_ECR_REPO_URL }}
+          PRIMARY_TAG="${ECR_REPO_URL}:${REF_NAME}-${PLATFORM}"
+          LATEST_TAG="${ECR_REPO_URL}:latest-${PLATFORM}"
+          RUNNERS_PRIMARY_TAG="${RUNNERS_ECR_REPO_URL}:${REF_NAME}-${PLATFORM}"
+          RUNNERS_LATEST_TAG="${RUNNERS_ECR_REPO_URL}:latest-${PLATFORM}"
+          RUNNERS_DISTROLESS_PRIMARY_TAG="${RUNNERS_ECR_REPO_URL}:${REF_NAME}-distroless-${PLATFORM}"
+          RUNNERS_DISTROLESS_LATEST_TAG="${RUNNERS_ECR_REPO_URL}:latest-distroless-${PLATFORM}"
+
+          # n8n / runners / distroless tags (single redirect for shellcheck SC2129)
+          {
+            echo "n8n_tags<<EOF"
+            echo "${PRIMARY_TAG}"
+            echo "${LATEST_TAG}"
+            echo "EOF"
+            echo "n8n_primary_tag=${PRIMARY_TAG}"
+            echo "runners_tags<<EOF"
+            echo "${RUNNERS_PRIMARY_TAG}"
+            echo "${RUNNERS_LATEST_TAG}"
+            echo "EOF"
+            echo "runners_distroless_tags<<EOF"
+            echo "${RUNNERS_DISTROLESS_PRIMARY_TAG}"
+            echo "${RUNNERS_DISTROLESS_LATEST_TAG}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_GITHUB_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push n8n image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/images/n8n/Dockerfile
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            N8N_VERSION=${{ steps.context.outputs.n8n_version }}
+            N8N_RELEASE_TYPE=stable
+          platforms: ${{ matrix.docker_platform }}
+          provenance: false
+          push: true
+          tags: ${{ steps.determine-tags.outputs.n8n_tags }}
+          cache-from: type=registry,ref=${{ secrets.ECR_REPO_URL }}:latest-${{ matrix.platform }}
+          cache-to: type=inline
+
+      - name: Build and push runners image (Alpine)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/images/runners/Dockerfile
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            N8N_VERSION=${{ steps.context.outputs.n8n_version }}
+            N8N_RELEASE_TYPE=stable
+          platforms: ${{ matrix.docker_platform }}
+          provenance: false
+          push: true
+          tags: ${{ steps.determine-tags.outputs.runners_tags }}
+          cache-from: type=registry,ref=${{ secrets.RUNNERS_ECR_REPO_URL }}:latest-${{ matrix.platform }}
+          cache-to: type=inline
+
+      - name: Build and push runners image (distroless)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/images/runners/Dockerfile.distroless
+          build-args: |
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            N8N_VERSION=${{ steps.context.outputs.n8n_version }}
+            N8N_RELEASE_TYPE=stable
+          platforms: ${{ matrix.docker_platform }}
+          provenance: false
+          push: true
+          tags: ${{ steps.determine-tags.outputs.runners_distroless_tags }}
+          cache-from: type=registry,ref=${{ secrets.RUNNERS_ECR_REPO_URL }}:latest-distroless-${{ matrix.platform }}
+          cache-to: type=inline
